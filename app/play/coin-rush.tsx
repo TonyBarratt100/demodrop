@@ -16,12 +16,16 @@ const SEND_MS = 66; // ~15 position updates per second
 const IDLE_SEND_MS = 1000; // heartbeat while standing still
 const COINS_RESYNC_MS = 1500; // host rebroadcasts coins so late joiners catch up
 const CLAIM_RETRY_MS = 1000;
+const HOST_GRACE_MS = 2000; // a new host listens before acting, so it inherits round + coins
+const ROUND_MS = 60_000;
+const BREAK_MS = 5_000; // "round over" screen between rounds
 const TOPIC = "coin-rush:arena";
 
 type Me = { id: string; name: string };
 type Coin = { id: string; x: number; y: number };
 type Remote = { name: string; x: number; y: number; tx: number; ty: number; seen: number };
 type Row = { user_id: string; name: string; score: number };
+type Round = { n: number; endsAt: number; scores: Map<string, { name: string; n: number }> };
 
 export function CoinRush() {
   const [me, setMe] = useState<Me | null>(null);
@@ -87,6 +91,7 @@ function JoinForm({ onJoined }: { onJoined: (me: Me) => void }) {
 
 function Arena({ me }: { me: Me }) {
   const canvasRef = useRef<HTMLCanvasElement>(null);
+  const [keys] = useState(() => new Set<string>()); // shared by keyboard and touch controls
   const [online, setOnline] = useState<{ id: string; name: string }[]>([]);
   const [hostId, setHostId] = useState<string | null>(null);
   const [board, setBoard] = useState<Row[]>([]);
@@ -119,12 +124,14 @@ function Arena({ me }: { me: Me }) {
     const remotes = new Map<string, Remote>();
     let coins: Coin[] = [];
     const pendingClaims = new Map<string, number>();
-    const keys = new Set<string>();
+    // Host owns the round clock; others follow the remaining time it broadcasts.
+    const round: Round = { n: 0, endsAt: 0, scores: new Map() };
     const flashes: { text: string; x: number; y: number; t: number }[] = [];
     let isHost = false;
     let currentHost: string | null = null;
     let channel: RealtimeChannel | null = null;
     let subscribed = false;
+    let subscribedAt = 0;
     let raf = 0;
     let lastFrame = performance.now();
     let lastSend = 0;
@@ -138,7 +145,7 @@ function Arena({ me }: { me: Me }) {
 
     const broadcastCoins = () => {
       lastCoinsBroadcast = performance.now();
-      send("coins", { from: me.id, coins });
+      send("coins", { from: me.id, coins, round: round.n, remaining: round.endsAt - performance.now() });
     };
 
     const onCollected = async (coinId: string, by: string, name: string) => {
@@ -146,7 +153,10 @@ function Arena({ me }: { me: Me }) {
       pendingClaims.delete(coinId);
       const holder = by === me.id ? self : remotes.get(by);
       flashes.push({ text: `+1 ${name}`, x: holder?.x ?? W / 2, y: holder?.y ?? H / 2, t: performance.now() });
+      const tally = round.scores.get(by);
+      round.scores.set(by, { name, n: (tally?.n ?? 0) + 1 });
       if (by !== me.id) return;
+      blip();
       const { data, error } = await supabase.rpc("bump_score");
       if (error) {
         console.warn("score write failed:", error.message);
@@ -159,11 +169,13 @@ function Arena({ me }: { me: Me }) {
 
     // Host only: first claim for a coin wins, everyone hears the result once.
     const hostHandleClaim = (coinId: string, by: string, name: string) => {
-      if (!coins.some((c) => c.id === coinId)) return;
+      if (performance.now() > round.endsAt || !coins.some((c) => c.id === coinId)) return;
       send("collected", { coinId, by, name });
       void onCollected(coinId, by, name);
       broadcastCoins();
     };
+
+    const hostReady = () => isHost && subscribedAt > 0 && performance.now() - subscribedAt > HOST_GRACE_MS;
 
     const recomputeHost = () => {
       const state = channel!.presenceState<{ name: string }>();
@@ -171,7 +183,7 @@ function Arena({ me }: { me: Me }) {
       currentHost = ids[0] ?? null;
       const wasHost = isHost;
       isHost = currentHost === me.id;
-      if (isHost && !wasHost) broadcastCoins();
+      if (wasHost && !isHost) broadcastCoins(); // hand round + coins to the new host
       setHostId(currentHost);
       setOnline(ids.map((id) => ({ id, name: state[id][0]?.name ?? "?" })));
       for (const id of remotes.keys()) if (!state[id]) remotes.delete(id);
@@ -225,13 +237,23 @@ function Arena({ me }: { me: Me }) {
         const pending = pendingClaims.get(c.id);
         if (pending && now - pending < CLAIM_RETRY_MS) continue;
         pendingClaims.set(c.id, now);
-        if (isHost) hostHandleClaim(c.id, me.id, me.name);
+        if (hostReady()) hostHandleClaim(c.id, me.id, me.name);
         else send("claim", { coinId: c.id, by: me.id, name: me.name });
       }
 
-      // Host: spawn coins and periodically resync.
-      if (isHost) {
-        if (coins.length < MAX_COINS && now - lastSpawn >= SPAWN_MS) {
+      // Host: run the round clock, spawn coins and periodically resync.
+      const host = hostReady();
+      if (host && (round.n === 0 || now > round.endsAt + BREAK_MS)) {
+        round.n += 1;
+        round.endsAt = now + ROUND_MS;
+        round.scores.clear();
+        broadcastCoins();
+      } else if (host && now > round.endsAt && coins.length) {
+        coins = [];
+        broadcastCoins();
+      }
+      if (host) {
+        if (now < round.endsAt && coins.length < MAX_COINS && now - lastSpawn >= SPAWN_MS) {
           lastSpawn = now;
           coins = [...coins, {
             id: crypto.randomUUID(),
@@ -244,7 +266,7 @@ function Arena({ me }: { me: Me }) {
         }
       }
 
-      draw(ctx, now, self, me, remotes, coins, flashes);
+      draw(ctx, now, self, me, remotes, coins, flashes, round);
       raf = requestAnimationFrame(frame);
     };
 
@@ -260,10 +282,15 @@ function Arena({ me }: { me: Me }) {
           else remotes.set(payload.id, { name: payload.name, x: payload.x, y: payload.y, tx: payload.x, ty: payload.y, seen: performance.now() });
         })
         .on("broadcast", { event: "coins" }, ({ payload }) => {
-          if (!isHost && payload.from === currentHost) coins = payload.coins;
+          // A host still in its grace period accepts the handoff from the previous host.
+          if (hostReady() || (!isHost && payload.from !== currentHost)) return;
+          coins = payload.coins;
+          if (payload.round !== round.n) round.scores.clear();
+          round.n = payload.round;
+          round.endsAt = performance.now() + payload.remaining;
         })
         .on("broadcast", { event: "claim" }, ({ payload }) => {
-          if (isHost) hostHandleClaim(payload.coinId, payload.by, payload.name);
+          if (hostReady()) hostHandleClaim(payload.coinId, payload.by, payload.name);
         })
         .on("broadcast", { event: "collected" }, ({ payload }) => {
           void onCollected(payload.coinId, payload.by, payload.name);
@@ -275,6 +302,7 @@ function Arena({ me }: { me: Me }) {
           setStatus(s.toLowerCase());
           if (s === "SUBSCRIBED") {
             subscribed = true;
+            subscribedAt = performance.now();
             await channel!.track({ name: me.name });
           } else {
             subscribed = false;
@@ -299,7 +327,7 @@ function Arena({ me }: { me: Me }) {
       subscribed = false;
       if (channel) void supabase.removeChannel(channel);
     };
-  }, [me, loadBoard]);
+  }, [me, keys, loadBoard]);
 
   return (
     <div className="flex flex-col gap-4 lg:flex-row">
@@ -310,6 +338,7 @@ function Arena({ me }: { me: Me }) {
           height={H}
           className="w-full rounded-lg border border-zinc-300 bg-zinc-950 dark:border-zinc-700"
         />
+        <TouchPad keys={keys} />
         <p className="mt-2 text-sm text-zinc-500">
           Arrow keys or WASD to move. Touch a coin first to score. Status: {status}
           {hostId === me.id && " · you are the host"}
@@ -363,6 +392,7 @@ function draw(
   remotes: Map<string, Remote>,
   coins: Coin[],
   flashes: { text: string; x: number; y: number; t: number }[],
+  round: Round,
 ) {
   ctx.fillStyle = "#09090b";
   ctx.fillRect(0, 0, W, H);
@@ -410,4 +440,78 @@ function draw(
     ctx.fillText(f.text, f.x, f.y - 24 - age * 20);
     ctx.globalAlpha = 1;
   }
+
+  const left = round.endsAt - now;
+  ctx.canvas.dataset.round = `${round.n}:${Math.round(left)}`; // read by the e2e check
+  if (round.n === 0) return;
+  ctx.fillStyle = "#e4e4e7";
+  ctx.font = "bold 16px sans-serif";
+  ctx.textAlign = "left";
+  const secs = Math.max(0, Math.ceil(left / 1000));
+  ctx.fillText(`Round ${round.n} · ${Math.floor(secs / 60)}:${String(secs % 60).padStart(2, "0")}`, 12, 24);
+  if (left > 0) return;
+
+  // Between rounds: show the round winner.
+  const best = [...round.scores.values()].sort((a, b) => b.n - a.n)[0];
+  ctx.fillStyle = "rgba(0, 0, 0, 0.6)";
+  ctx.fillRect(0, 0, W, H);
+  ctx.fillStyle = "#facc15";
+  ctx.font = "bold 32px sans-serif";
+  ctx.textAlign = "center";
+  ctx.fillText("Round over!", W / 2, H / 2 - 16);
+  ctx.fillStyle = "#e4e4e7";
+  ctx.font = "18px sans-serif";
+  ctx.fillText(best ? `${best.name} wins with ${best.n}` : "Nobody scored", W / 2, H / 2 + 20);
+}
+
+// Short "ding" for your own pickups. Created lazily; the join click counts as the user gesture.
+let audio: AudioContext | undefined;
+function blip() {
+  try {
+    audio ??= new AudioContext();
+    const osc = audio.createOscillator();
+    const gain = audio.createGain();
+    const t = audio.currentTime;
+    osc.frequency.setValueAtTime(880, t);
+    osc.frequency.exponentialRampToValueAtTime(1760, t + 0.08);
+    gain.gain.setValueAtTime(0.15, t);
+    gain.gain.exponentialRampToValueAtTime(0.001, t + 0.15);
+    osc.connect(gain).connect(audio.destination);
+    osc.start(t);
+    osc.stop(t + 0.15);
+  } catch {
+    // No audio available; the game works fine without it.
+  }
+}
+
+// On-screen D-pad for phones; feeds the same key set as the keyboard.
+function TouchPad({ keys }: { keys: Set<string> }) {
+  const btn = (key: string, label: string, area: string) => (
+    <button
+      type="button"
+      aria-label={key.replace("Arrow", "")}
+      style={{ gridArea: area, touchAction: "none" }}
+      className="rounded-lg bg-zinc-800 text-2xl text-white select-none active:bg-zinc-600"
+      onPointerDown={(e) => {
+        e.currentTarget.setPointerCapture(e.pointerId);
+        keys.add(key);
+      }}
+      onPointerUp={() => keys.delete(key)}
+      onPointerCancel={() => keys.delete(key)}
+      onContextMenu={(e) => e.preventDefault()}
+    >
+      {label}
+    </button>
+  );
+  return (
+    <div
+      className="mx-auto mt-3 hidden h-40 w-40 gap-1 pointer-coarse:grid"
+      style={{ gridTemplateAreas: '". u ." "l . r" ". d ."', gridTemplateColumns: "repeat(3, 1fr)" }}
+    >
+      {btn("ArrowUp", "▲", "u")}
+      {btn("ArrowLeft", "◀", "l")}
+      {btn("ArrowRight", "▶", "r")}
+      {btn("ArrowDown", "▼", "d")}
+    </div>
+  );
 }
